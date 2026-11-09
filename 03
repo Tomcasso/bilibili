@@ -1,0 +1,1032 @@
+
+import re
+import time
+import random
+import hashlib
+import html
+import urllib.parse
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+import requests
+import pandas as pd
+
+
+# ==================================================
+# 1. 基础配置
+# ==================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+BASE_URL = "https://api.bilibili.com"
+
+# 默认搜索关键词
+DEFAULT_KEYWORDS = [
+    "岭南饮食文化",
+    "粤菜文化",
+    "广府菜",
+    "客家菜",
+    "潮汕美食"
+]
+
+# 每个关键词最高采集数量
+MAX_RESULTS_LIMIT = 1000
+
+# B站每页搜索数量
+PAGE_SIZE = 20
+
+# 搜索分页安全上限
+MAX_PAGES = 50
+
+# 连续没有新有效视频的页数上限
+MAX_NO_NEW_PAGES = 3
+
+# 北京时间
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+# ==================================================
+# 2. 请求配置
+# ==================================================
+
+session = requests.Session()
+
+headers = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/131.0.0.0 "
+        "Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+    "Accept": "application/json, text/plain, */*"
+}
+
+
+# ==================================================
+# 3. WBI签名配置
+# ==================================================
+
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32,
+    15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61,
+    26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63,
+    57, 62, 11, 36, 20, 34, 44, 52
+]
+
+
+def get_mixin_key(orig):
+    """生成WBI混合密钥"""
+
+    return "".join(
+        orig[i] for i in MIXIN_KEY_ENC_TAB
+    )[:32]
+
+
+def get_wbi_keys():
+    """获取B站WBI密钥"""
+
+    response = session.get(
+        BASE_URL + "/x/web-interface/nav",
+        headers=headers,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    wbi_data = data.get("data", {})
+    wbi_img = wbi_data.get("wbi_img", {})
+
+    img_url = wbi_img.get("img_url", "")
+    sub_url = wbi_img.get("sub_url", "")
+
+    if not img_url or not sub_url:
+        raise RuntimeError(
+            f"无法获取WBI密钥：{data}"
+        )
+
+    img_key = (
+        img_url.rsplit("/", 1)[1].split(".")[0]
+    )
+
+    sub_key = (
+        sub_url.rsplit("/", 1)[1].split(".")[0]
+    )
+
+    print("WBI密钥获取成功")
+
+    return get_mixin_key(
+        img_key + sub_key
+    )
+
+
+def sign_params(params, mixin_key):
+    """生成WBI请求签名"""
+
+    params = params.copy()
+
+    params["wts"] = int(time.time())
+
+    params = {
+        key: re.sub(
+            r"[!'()*]",
+            "",
+            str(value)
+        )
+        for key, value in params.items()
+    }
+
+    query = urllib.parse.urlencode(
+        sorted(params.items())
+    )
+
+    params["w_rid"] = hashlib.md5(
+        (query + mixin_key).encode("utf-8")
+    ).hexdigest()
+
+    return params
+
+
+# ==================================================
+# 4. 数据格式转换
+# ==================================================
+
+def clean_text(text):
+    """清理HTML标签"""
+
+    if not text:
+        return ""
+
+    text = html.unescape(str(text))
+
+    text = re.sub(
+        r"<[^>]+>",
+        "",
+        text
+    )
+
+    return text.strip()
+
+
+def format_duration(duration):
+    """统一视频时长格式为HH:MM:SS"""
+
+    if not duration:
+        return ""
+
+    parts = str(duration).strip().split(":")
+
+    try:
+
+        if len(parts) == 2:
+
+            minutes, seconds = map(int, parts)
+
+            return (
+                f"{minutes // 60:02d}:"
+                f"{minutes % 60:02d}:"
+                f"{seconds:02d}"
+            )
+
+        elif len(parts) == 3:
+
+            hours, minutes, seconds = map(int, parts)
+
+            return (
+                f"{hours:02d}:"
+                f"{minutes:02d}:"
+                f"{seconds:02d}"
+            )
+
+    except ValueError:
+        return ""
+
+    return ""
+
+
+def format_publish_time(timestamp):
+    """将时间戳转换为北京时间"""
+
+    if not timestamp:
+        return ""
+
+    try:
+
+        dt = datetime.fromtimestamp(
+            int(timestamp),
+            tz=timezone.utc
+        ).astimezone(BEIJING_TZ)
+
+        return dt.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    except (ValueError, TypeError, OSError):
+        return ""
+
+
+def format_number(number):
+    """整理数字字段"""
+
+    if number is None:
+        return 0
+
+    try:
+        return int(number)
+
+    except (ValueError, TypeError):
+        return 0
+
+
+# ==================================================
+# 5. 岭南饮食主题词库
+# ==================================================
+
+# 核心主题词
+CORE_TERMS = [
+    "岭南饮食",
+    "岭南美食",
+    "岭南菜",
+    "粤菜",
+    "广府菜",
+    "广府饮食",
+    "潮汕菜",
+    "潮州菜",
+    "潮汕美食",
+    "客家菜",
+    "客家美食",
+    "粤式点心",
+    "广东菜",
+    "广东美食",
+    "广东饮食",
+    "广东传统美食",
+    "广东非遗美食",
+    "广东饮食文化",
+    "广东传统饮食"
+]
+
+# 具体菜品及饮食技艺
+DISH_TERMS = [
+    "白切鸡",
+    "烧鹅",
+    "叉烧",
+    "烧腊",
+    "肠粉",
+    "云吞面",
+    "艇仔粥",
+    "虾饺",
+    "凤爪",
+    "双皮奶",
+    "姜撞奶",
+    "萝卜牛杂",
+    "煲仔饭",
+    "早茶",
+    "广式月饼",
+    "酿豆腐",
+    "梅菜扣肉",
+    "盐焗鸡",
+    "客家酿酒",
+    "客家擂茶",
+    "蚝烙",
+    "潮汕牛肉火锅",
+    "潮汕牛肉丸",
+    "潮汕砂锅粥",
+    "潮汕卤鹅",
+    "潮汕生腌",
+    "潮汕鱼饭",
+    "潮汕粿品",
+    "牛肉丸",
+    "粿条",
+    "老婆饼",
+    "广式腊味",
+    "广东凉茶",
+    "粤式烹饪"
+]
+
+# 饮食上下文词
+FOOD_CONTEXT_TERMS = [
+    "饮食文化",
+    "烹饪技艺",
+    "传统技艺",
+    "制作过程",
+    "制作方法",
+    "美食制作",
+    "菜肴",
+    "菜品",
+    "食谱",
+    "传统小吃",
+    "传统菜",
+    "特色美食",
+    "地方美食",
+    "非遗美食",
+    "非物质文化遗产",
+    "饮食习俗",
+    "传统美食",
+    "烹饪",
+    "美食",
+    "小吃",
+    "食物",
+    "菜谱"
+]
+
+
+# ==================================================
+# 6. 视频主题相关性判断
+# ==================================================
+
+def check_relevance(title, description):
+    """
+    根据视频标题和简介判断是否与岭南饮食相关。
+
+    返回：
+    是否相关、评分、匹配依据
+    """
+
+    title = clean_text(title).lower()
+    description = clean_text(description).lower()
+
+    score = 0
+    matched_terms = []
+
+    # 核心主题词
+    for term in CORE_TERMS:
+
+        term_lower = term.lower()
+
+        if term_lower in title:
+
+            score += 5
+
+            matched_terms.append(
+                f"标题：{term}"
+            )
+
+        elif term_lower in description:
+
+            score += 3
+
+            matched_terms.append(
+                f"简介：{term}"
+            )
+
+    # 具体菜品
+    for term in DISH_TERMS:
+
+        term_lower = term.lower()
+
+        if term_lower in title:
+
+            score += 4
+
+            matched_terms.append(
+                f"标题：{term}"
+            )
+
+        elif term_lower in description:
+
+            score += 2
+
+            matched_terms.append(
+                f"简介：{term}"
+            )
+
+    # 是否存在饮食上下文
+    context_count = 0
+
+    for term in FOOD_CONTEXT_TERMS:
+
+        if (
+            term.lower() in title
+            or term.lower() in description
+        ):
+
+            context_count += 1
+
+    # 核心主题词
+    has_core = any(
+        term.lower() in title
+        or term.lower() in description
+        for term in CORE_TERMS
+    )
+
+    # 具体菜品
+    has_dish = any(
+        term.lower() in title
+        or term.lower() in description
+        for term in DISH_TERMS
+    )
+
+    # 没有核心主题或具体菜品，直接排除
+    if not (has_core or has_dish):
+
+        return False, score, ""
+
+    # 仅出现菜品名称时，还需要饮食语境
+    if not has_core and context_count == 0:
+
+        return False, score, ""
+
+    is_relevant = score >= 3
+
+    matched_terms = list(
+        dict.fromkeys(matched_terms)
+    )
+
+    return (
+        is_relevant,
+        score,
+        "；".join(matched_terms)
+    )
+
+
+# ==================================================
+# 7. 单个关键词搜索与自动分页
+# ==================================================
+
+def search_videos(
+    keyword,
+    target_count,
+    mixin_key
+):
+    """
+    只搜索用户输入的原始关键词。
+
+    target_count是有效视频目标数量。
+    """
+
+    print(f"\n正在搜索：{keyword}")
+
+    videos = []
+
+    collected_ids = set()
+
+    page = 1
+
+    no_new_pages = 0
+
+    stopped_by_error = False
+
+    while (
+        len(videos) < target_count
+        and page <= MAX_PAGES
+    ):
+
+        params = {
+            "search_type": "video",
+            "keyword": keyword,
+            "page": page,
+            "page_size": PAGE_SIZE,
+            "order": "totalrank"
+        }
+
+        signed_params = sign_params(
+            params,
+            mixin_key
+        )
+
+        try:
+
+            response = session.get(
+                BASE_URL + "/x/web-interface/wbi/search/type",
+                params=signed_params,
+                headers=headers,
+                timeout=30
+            )
+
+            response.raise_for_status()
+
+            result = response.json()
+
+            if result.get("code") != 0:
+
+                print(
+                    f"搜索接口异常："
+                    f"错误代码 {result.get('code')}，"
+                    f"原因：{result.get('message')}"
+                )
+
+                stopped_by_error = True
+                break
+
+            data = result.get("data", {})
+
+            items = data.get("result", [])
+
+            # 没有搜索结果
+            if not items:
+
+                print("没有更多搜索结果。")
+                break
+
+            new_count = 0
+
+            for item in items:
+
+                bvid = item.get("bvid", "")
+
+                # 过滤无效BV号
+                if (
+                    not bvid
+                    or not bvid.startswith("BV")
+                ):
+                    continue
+
+                # 同一关键词内部去重
+                if bvid in collected_ids:
+                    continue
+
+                title = clean_text(
+                    item.get("title", "")
+                )
+
+                description = clean_text(
+                    item.get(
+                        "description",
+                        item.get("desc", "")
+                    )
+                )
+
+                # 判断主题相关性
+                is_relevant, score, reason = (
+                    check_relevance(
+                        title,
+                        description
+                    )
+                )
+
+                # 排除不相关视频
+                if not is_relevant:
+                    continue
+
+                collected_ids.add(bvid)
+
+                thumbnail = item.get("pic", "")
+
+                if thumbnail.startswith("//"):
+
+                    thumbnail = (
+                        "https:" + thumbnail
+                    )
+
+                video = {
+
+                    "video_id": bvid,
+
+                    "视频标题": title,
+
+                    "UP主名称": item.get(
+                        "author", ""
+                    ),
+
+                    "发布时间": format_publish_time(
+                        item.get("pubdate", 0)
+                    ),
+
+                    "视频时长": format_duration(
+                        item.get("duration", "")
+                    ),
+
+                    "视频简介": description,
+
+                    "视频分区": item.get(
+                        "typename", ""
+                    ),
+
+                    "播放量": format_number(
+                        item.get("play", 0)
+                    ),
+
+                    "点赞量": format_number(
+                        item.get("like", 0)
+                    ),
+
+                    "收藏量": format_number(
+                        item.get("favorites", 0)
+                    ),
+
+                    "检索关键词": keyword,
+
+                    "相关性评分": score,
+
+                    "相关性依据": reason,
+
+                    "审核状态": (
+                        "标题/简介初筛，待人工复核"
+                    ),
+
+                    "视频链接": (
+                        f"https://www.bilibili.com/video/{bvid}"
+                    ),
+
+                    "视频封面": thumbnail
+                }
+
+                videos.append(video)
+
+                new_count += 1
+
+                # 达到目标数量
+                if len(videos) >= target_count:
+                    break
+
+            # 达到目标数量，结束
+            if len(videos) >= target_count:
+                break
+
+            # 判断本页是否有新的有效视频
+            if new_count == 0:
+
+                no_new_pages += 1
+
+            else:
+
+                no_new_pages = 0
+
+            # 连续三页没有新结果，停止
+            if no_new_pages >= MAX_NO_NEW_PAGES:
+
+                print(
+                    "连续多页没有新的有效视频，停止搜索。"
+                )
+
+                break
+
+            page += 1
+
+            # 控制请求频率
+            time.sleep(
+                random.uniform(1.5, 2.5)
+            )
+
+        except requests.RequestException as e:
+
+            print(f"网络请求失败：{e}")
+
+            stopped_by_error = True
+            break
+
+        except Exception as e:
+
+            print(f"采集失败：{e}")
+
+            stopped_by_error = True
+            break
+
+    if page > MAX_PAGES:
+
+        print("已达到程序设置的分页安全上限。")
+
+    print("\n" + "-" * 45)
+
+    print(f"关键词：{keyword}")
+    print(f"目标数量：{target_count}")
+    print(f"实际有效数量：{len(videos)}")
+
+    if len(videos) < target_count:
+
+        print(
+            f"未完成数量："
+            f"{target_count - len(videos)}"
+        )
+
+        print(
+            "提示：当前关键词可获取的有效搜索结果不足，"
+            "或搜索过程受到接口限制。"
+        )
+
+    else:
+
+        print("已达到目标数量！")
+
+    return videos, stopped_by_error
+
+
+# ==================================================
+# 8. 多关键词采集与去重
+# ==================================================
+
+def crawl_all_videos(
+    keywords,
+    target_count,
+    mixin_key
+):
+    """
+    每个关键词独立采集目标数量。
+    最终Excel按照BV号统一去重。
+    """
+
+    all_videos = {}
+
+    keyword_results = []
+
+    for keyword in keywords:
+
+        print("\n" + "=" * 45)
+
+        print(f"开始采集关键词：{keyword}")
+
+        print(
+            f"目标有效视频数量：{target_count}"
+        )
+
+        print("=" * 45)
+
+        videos, stopped_by_error = search_videos(
+            keyword,
+            target_count,
+            mixin_key
+        )
+
+        actual_count = len(videos)
+
+        keyword_results.append({
+            "关键词": keyword,
+            "目标数量": target_count,
+            "实际数量": actual_count,
+            "缺少数量": max(
+                0,
+                target_count - actual_count
+            ),
+            "是否达到目标": (
+                "是" if actual_count >= target_count
+                else "否"
+            ),
+            "是否发生请求错误": (
+                "是" if stopped_by_error else "否"
+            )
+        })
+
+        for video in videos:
+
+            video_id = video["video_id"]
+
+            if video_id in all_videos:
+
+                # 合并检索关键词
+                old_keywords = (
+                    all_videos[video_id]["检索关键词"]
+                ).split("；")
+
+                if keyword not in old_keywords:
+
+                    all_videos[video_id]["检索关键词"] += (
+                        f"；{keyword}"
+                    )
+
+            else:
+
+                all_videos[video_id] = video
+
+    return (
+        list(all_videos.values()),
+        keyword_results
+    )
+
+
+# ==================================================
+# 9. Excel导出
+# ==================================================
+
+def export_to_excel(
+    videos,
+    keyword_results
+):
+    """导出视频数据和关键词采集统计"""
+
+    if not videos:
+
+        print(
+            "\n没有采集到符合主题的视频，"
+            "暂不生成Excel。"
+        )
+
+        return
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    file_path = (
+        OUTPUT_DIR
+        / f"Lingnan_Bilibili_{timestamp}.xlsx"
+    )
+
+    # 视频数据
+    df = pd.DataFrame(videos)
+
+    df = df.drop(
+        columns=["video_id"]
+    )
+
+    columns = [
+        "视频标题",
+        "UP主名称",
+        "发布时间",
+        "视频时长",
+        "视频简介",
+        "视频分区",
+        "播放量",
+        "点赞量",
+        "收藏量",
+        "检索关键词",
+        "相关性评分",
+        "相关性依据",
+        "审核状态",
+        "视频链接",
+        "视频封面"
+    ]
+
+    df = df[columns]
+
+    # 关键词采集统计
+    summary_df = pd.DataFrame(
+        keyword_results
+    )
+
+    # 使用两个工作表
+    with pd.ExcelWriter(
+        file_path,
+        engine="openpyxl"
+    ) as writer:
+
+        df.to_excel(
+            writer,
+            sheet_name="视频数据",
+            index=False
+        )
+
+        summary_df.to_excel(
+            writer,
+            sheet_name="关键词采集统计",
+            index=False
+        )
+
+    print("\n" + "=" * 50)
+
+    print("B站岭南饮食主题视频采集完成！")
+
+    print(
+        f"最终不重复视频数量：{len(videos)} 条"
+    )
+
+    print("\n各关键词采集结果：")
+
+    for item in keyword_results:
+
+        print(
+            f"{item['关键词']}："
+            f"{item['实际数量']}/"
+            f"{item['目标数量']} 条"
+        )
+
+        if item["缺少数量"] > 0:
+
+            print(
+                f"  尚缺：{item['缺少数量']} 条"
+            )
+
+    print(
+        f"\nExcel文件已保存至：{file_path}"
+    )
+
+    print("=" * 50)
+
+
+# ==================================================
+# 10. 主程序
+# ==================================================
+
+def main():
+
+    print("=" * 50)
+
+    print(
+        "       岭南非遗饮食 B站视频采集系统"
+    )
+
+    print("=" * 50)
+
+    # 输入关键词
+    print("\n默认关键词：")
+
+    print("、".join(DEFAULT_KEYWORDS))
+
+    user_input = input(
+        "\n请输入搜索关键词"
+        "（多个关键词用英文或中文逗号分隔，"
+        "直接回车使用默认关键词）："
+    ).strip()
+
+    if user_input:
+
+        keywords = [
+            word.strip()
+            for word in re.split(
+                r"[,，]",
+                user_input
+            )
+            if word.strip()
+        ]
+
+    else:
+
+        keywords = DEFAULT_KEYWORDS.copy()
+
+    # 删除重复输入的关键词
+    keywords = list(
+        dict.fromkeys(keywords)
+    )
+
+    if not keywords:
+
+        print("没有输入有效关键词，程序结束。")
+        return
+
+    # 输入目标数量
+    number_input = input(
+        "\n请输入每个关键词目标有效视频数量"
+        "（默认20，最高1000）："
+    ).strip()
+
+    try:
+
+        target_count = (
+            int(number_input)
+            if number_input
+            else 20
+        )
+
+        if not 1 <= target_count <= MAX_RESULTS_LIMIT:
+
+            raise ValueError
+
+    except ValueError:
+
+        print("输入不合法，使用默认数量20。")
+
+        target_count = 20
+
+    print("\n采集配置：")
+
+    print(f"搜索关键词数量：{len(keywords)}")
+
+    print(
+        f"每个关键词目标有效视频："
+        f"{target_count} 条"
+    )
+
+    print(
+        f"理论目标总数（去重前）："
+        f"{len(keywords) * target_count} 条"
+    )
+
+    print("\n搜索模式：仅搜索输入的关键词，不自动扩展。")
+
+    print("筛选模式：标题和简介相关性筛选。")
+
+    try:
+
+        # 建立B站会话
+        session.get(
+            "https://www.bilibili.com/",
+            headers=headers,
+            timeout=20
+        )
+
+        # 获取WBI密钥
+        mixin_key = get_wbi_keys()
+
+        print("B站接口连接成功，开始采集。")
+
+        # 开始采集
+        videos, keyword_results = crawl_all_videos(
+            keywords,
+            target_count,
+            mixin_key
+        )
+
+        # 导出Excel
+        export_to_excel(
+            videos,
+            keyword_results
+        )
+
+    except requests.RequestException as e:
+
+        print(f"\n网络连接失败：{e}")
+
+    except Exception as e:
+
+        print(f"\n程序运行失败：{e}")
+
+
+if __name__ == "__main__":
+    main()
