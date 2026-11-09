@@ -1,0 +1,169 @@
+
+import requests
+import time
+import hashlib
+import urllib.parse
+import re
+
+# B站请求地址
+BASE_URL = "https://api.bilibili.com"
+
+# 请求会话
+session = requests.Session()
+
+# 浏览器请求头
+headers = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+}
+
+
+# WBI签名所需的字符顺序
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32,
+    15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61,
+    26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63,
+    57, 62, 11, 36, 20, 34, 44, 52
+]
+
+
+def get_mixin_key(orig):
+    return "".join(
+        orig[i] for i in MIXIN_KEY_ENC_TAB
+    )[:32]
+
+
+
+def get_wbi_keys():
+    """获取B站WBI签名密钥，允许未登录状态下提取"""
+
+    response = session.get(
+        BASE_URL + "/x/web-interface/nav",
+        headers=headers,
+        timeout=20
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    # 不直接判断 code 是否为0
+    # 因为未登录时，部分情况下仍会返回WBI密钥
+    wbi_data = data.get("data", {})
+    wbi_img = wbi_data.get("wbi_img", {})
+
+    img_url = wbi_img.get("img_url", "")
+    sub_url = wbi_img.get("sub_url", "")
+
+    if not img_url or not sub_url:
+        raise RuntimeError(
+            f"无法获取WBI密钥：{data}"
+        )
+
+    img_key = img_url.rsplit("/", 1)[1].split(".")[0]
+    sub_key = sub_url.rsplit("/", 1)[1].split(".")[0]
+
+    print("WBI密钥获取成功")
+
+    return get_mixin_key(img_key + sub_key)
+
+
+def sign_params(params, mixin_key):
+    """生成WBI签名"""
+
+    params["wts"] = int(time.time())
+
+    params = {
+        key: re.sub(r"[!'()*]", "", str(value))
+        for key, value in params.items()
+    }
+
+    query = urllib.parse.urlencode(
+        sorted(params.items())
+    )
+
+    params["w_rid"] = hashlib.md5(
+        (query + mixin_key).encode("utf-8")
+    ).hexdigest()
+
+    return params
+
+
+def search_bilibili(keyword):
+    """搜索B站视频"""
+
+    print(f"正在搜索：{keyword}")
+
+    # 先访问B站首页，建立会话
+    session.get(
+        "https://www.bilibili.com/",
+        headers=headers,
+        timeout=20
+    )
+
+    # 获取WBI密钥
+    mixin_key = get_wbi_keys()
+
+    params = {
+        "search_type": "video",
+        "keyword": keyword,
+        "page": 1,
+        "page_size": 20,
+        "order": "totalrank",
+    }
+
+    signed_params = sign_params(
+        params,
+        mixin_key
+    )
+
+    response = session.get(
+        BASE_URL + "/x/web-interface/wbi/search/type",
+        params=signed_params,
+        headers=headers,
+        timeout=20
+    )
+
+    response.raise_for_status()
+    result = response.json()
+
+    if result.get("code") != 0:
+        raise RuntimeError(
+            f"B站搜索失败：{result.get('message')} "
+            f"(code={result.get('code')})"
+        )
+
+    videos = result.get("data", {}).get("result", [])
+
+    print(f"\n成功获取 {len(videos)} 条视频：\n")
+
+    for index, video in enumerate(videos, 1):
+
+        title = re.sub(
+            r"<[^>]+>", "",
+            video.get("title", "")
+        )
+
+        print(f"{index}. {title}")
+        print(f"   UP主：{video.get('author', '')}")
+        print(f"   BV号：{video.get('bvid', '')}")
+        print(f"   时长：{video.get('duration', '')}")
+        print(
+            "   链接：https://www.bilibili.com/video/"
+            + video.get("bvid", "")
+        )
+        print("-" * 40)
+
+
+if __name__ == "__main__":
+    try:
+        search_bilibili("粤菜文化")
+
+    except Exception as e:
+        print(f"\n程序运行失败：{e}")
